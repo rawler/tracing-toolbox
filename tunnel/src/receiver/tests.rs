@@ -227,3 +227,124 @@ fn restoring_span_after_recording_values() {
 
     visit_and_drop_span(&mut receiver);
 }
+
+fn receiver_with_persisted_span() -> TracingEventReceiver {
+    let metadata = PersistedMetadata {
+        inner: HashMap::from_iter([(0, CALL_SITE_DATA)]),
+    };
+    let spans = PersistedSpans {
+        inner: HashMap::from_iter([(
+            1,
+            SpanData {
+                metadata_id: 0,
+                parent_id: None,
+                ref_count: 1,
+                values: TracedValues::new(),
+            },
+        )]),
+    };
+    TracingEventReceiver::new(metadata, spans, LocalSpans::default())
+}
+
+#[test]
+fn restored_parent_span_is_created_for_child_span() {
+    let mut receiver = receiver_with_persisted_span();
+    receiver.receive(TracingEvent::NewSpan {
+        id: 2,
+        parent_id: Some(1),
+        metadata_id: 0,
+        values: TracedValues::new(),
+    });
+    assert!(receiver.local_spans.inner.contains_key(&1));
+    assert!(receiver.local_spans.inner.contains_key(&2));
+}
+
+#[test]
+fn restored_parent_span_is_created_for_event() {
+    let mut receiver = receiver_with_persisted_span();
+    receiver.receive(TracingEvent::NewEvent {
+        metadata_id: 0,
+        parent: Some(1),
+        values: TracedValues::new(),
+    });
+    assert!(receiver.local_spans.inner.contains_key(&1));
+}
+
+#[test]
+fn span_entered_multiple_times_is_tracked() {
+    let mut receiver = receiver_with_persisted_span();
+    receiver.receive(TracingEvent::SpanEntered { id: 1 });
+    receiver.receive(TracingEvent::SpanEntered { id: 1 });
+    receiver.receive(TracingEvent::SpanExited { id: 1 });
+    assert_eq!(receiver.current_execution.entered_span_ids[&1], 1);
+
+    receiver.receive(TracingEvent::SpanExited { id: 1 });
+    assert!(receiver.current_execution.entered_span_ids.is_empty());
+}
+
+#[test]
+fn dropping_entered_span_exits_it() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use tracing_subscriber::{Layer, layer::Context, prelude::*};
+
+    #[derive(Default)]
+    struct ExitCounter(Arc<AtomicUsize>);
+
+    impl<S: tracing_core::Subscriber> Layer<S> for ExitCounter {
+        fn on_exit(&self, _id: &Id, _ctx: Context<'_, S>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let counter = ExitCounter::default();
+    let exit_count = counter.0.clone();
+    let subscriber = tracing_subscriber::registry().with(counter);
+    tracing::subscriber::with_default(subscriber, || {
+        let mut receiver = receiver_with_persisted_span();
+        receiver.receive(TracingEvent::SpanEntered { id: 1 });
+        receiver.receive(TracingEvent::SpanEntered { id: 1 });
+        receiver.receive(TracingEvent::SpanDropped { id: 1 });
+        assert!(receiver.current_execution.entered_span_ids.is_empty());
+        assert_eq!(exit_count.load(Ordering::SeqCst), 2);
+    });
+}
+
+#[test]
+fn parent_cycle_in_persisted_spans_is_an_error() {
+    let metadata = PersistedMetadata {
+        inner: HashMap::from_iter([(0, CALL_SITE_DATA)]),
+    };
+    let span = |parent_id| SpanData {
+        metadata_id: 0,
+        parent_id: Some(parent_id),
+        ref_count: 1,
+        values: TracedValues::new(),
+    };
+    let spans = PersistedSpans {
+        inner: HashMap::from_iter([(1, span(2)), (2, span(1))]),
+    };
+    let mut receiver = TracingEventReceiver::new(metadata, spans, LocalSpans::default());
+
+    let err = receiver
+        .try_receive(TracingEvent::SpanEntered { id: 1 })
+        .unwrap_err();
+    assert_matches!(err, ReceiveError::SpanParentCycle(1));
+}
+
+#[test]
+fn event_with_unknown_metadata_does_not_create_parent_spans() {
+    let mut receiver = receiver_with_persisted_span();
+    let err = receiver
+        .try_receive(TracingEvent::NewEvent {
+            metadata_id: 42,
+            parent: Some(1),
+            values: TracedValues::new(),
+        })
+        .unwrap_err();
+    assert_matches!(err, ReceiveError::UnknownMetadataId(42));
+    assert!(!receiver.local_spans.inner.contains_key(&1));
+}
