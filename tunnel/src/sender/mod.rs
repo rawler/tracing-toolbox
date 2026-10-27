@@ -12,16 +12,23 @@ use tracing_core::{
 
 #[cfg(feature = "std")]
 pub use self::sync::Synced;
-use crate::{CallSiteData, MetadataId, RawSpanId, TracedValues, TracingEvent};
+use crate::{CallSiteData, MetadataId, ROOT_SPAN_ID, RawSpanId, TracedValues, TracingEvent};
 
+#[cfg(feature = "std")]
+mod stack;
 #[cfg(feature = "std")]
 mod sync;
 
 impl TracingEvent {
-    fn new_span(span: &Attributes<'_>, metadata_id: MetadataId, id: RawSpanId) -> Self {
+    fn new_span(
+        span: &Attributes<'_>,
+        parent_id: Option<RawSpanId>,
+        metadata_id: MetadataId,
+        id: RawSpanId,
+    ) -> Self {
         Self::NewSpan {
             id,
-            parent_id: span.parent().map(Id::into_u64),
+            parent_id,
             metadata_id,
             values: TracedValues::from_values(span.values()),
         }
@@ -34,10 +41,10 @@ impl TracingEvent {
         }
     }
 
-    fn new_event(event: &Event<'_>, metadata_id: MetadataId) -> Self {
+    fn new_event(event: &Event<'_>, parent: Option<RawSpanId>, metadata_id: MetadataId) -> Self {
         Self::NewEvent {
             metadata_id,
-            parent: event.parent().map(Id::into_u64),
+            parent,
             values: TracedValues::from_event(event),
         }
     }
@@ -46,8 +53,8 @@ impl TracingEvent {
 /// Event synchronization used by [`TracingEventSender`].
 ///
 /// Synchronization might be necessary in a multithreaded environments, where events may arrive from
-/// different threads out of order. This functionality is encapsulated in the (`std`-dependent) [`Synced`]
-/// implementation.
+/// different threads out of order, and where the current span is thread-specific.
+/// This functionality is encapsulated in the (`std`-dependent) [`Synced`] implementation.
 ///
 /// For single-threaded environments (e.g., WASM), there is the no-op `()` implementation.
 pub trait EventSync: 'static + Send + Sync {
@@ -59,13 +66,28 @@ pub trait EventSync: 'static + Send + Sync {
         sender: impl Fn(TracingEvent),
     );
 
-    /// Called when a new span or event arrives.
+    /// Called when a new span or event arrives. Ensures that its call site is registered,
+    /// and returns the parent ID to send for the span / event.
     #[doc(hidden)] // implementation detail
-    fn ensure_callsite_registered(
+    fn on_new_span_or_event(
         &self,
         metadata: &'static Metadata<'static>,
+        explicit_parent: Option<&Id>,
+        is_contextual: bool,
         sender: impl Fn(TracingEvent),
-    );
+    ) -> Option<RawSpanId>;
+
+    /// Called when a span is entered.
+    #[doc(hidden)] // implementation detail
+    fn enter(&self, _span: &Id) {
+        // Do nothing by default
+    }
+
+    /// Called when a span is exited.
+    #[doc(hidden)] // implementation detail
+    fn exit(&self, _span: &Id) {
+        // Do nothing by default
+    }
 }
 
 /// Default implementation that does not perform any synchronization.
@@ -81,12 +103,19 @@ impl EventSync for () {
         });
     }
 
-    fn ensure_callsite_registered(
+    /// Does not register the call site, and leaves contextual parents for the receiver to resolve.
+    fn on_new_span_or_event(
         &self,
         _metadata: &'static Metadata<'static>,
+        explicit_parent: Option<&Id>,
+        is_contextual: bool,
         _sender: impl Fn(TracingEvent),
-    ) {
-        // Do nothing
+    ) -> Option<RawSpanId> {
+        match explicit_parent {
+            Some(parent) => Some(parent.into_u64()),
+            None if is_contextual => None,
+            None => Some(ROOT_SPAN_ID),
+        }
     }
 }
 
@@ -127,6 +156,10 @@ impl<F: Fn(TracingEvent) + 'static> TracingEventSender<F> {
 #[cfg(feature = "std")]
 impl<F: Fn(TracingEvent) + 'static> TracingEventSender<F, Synced> {
     /// Creates a subscriber with the specified "on event" hook and synchronized event processing.
+    ///
+    /// The hook may be called while holding a lock shared by all threads (this ensures that call
+    /// sites are registered before they are referenced), so it should not block for long,
+    /// and must not emit tracing events / spans to this subscriber, which would deadlock.
     pub fn sync(on_event: F) -> Self {
         Self {
             next_span_id: AtomicU32::new(1), // 0 is invalid span ID
@@ -158,12 +191,21 @@ impl<F: Fn(TracingEvent) + 'static, S: EventSync> Subscriber for TracingEventSen
         // Practice shows that the caller may not synchronize its register_callsite calls,
         // allowing a new_span call to take effect before the registration completes.
         // We guarantee that references are valid, even when multithreaded.
-        self.sync
-            .ensure_callsite_registered(span.metadata(), &self.on_event);
+        let parent_id = self.sync.on_new_span_or_event(
+            span.metadata(),
+            span.parent(),
+            span.is_contextual(),
+            &self.on_event,
+        );
 
         let metadata_id = metadata_id(span.metadata());
         let span_id = u64::from(self.next_span_id.fetch_add(1, Ordering::SeqCst));
-        self.send(TracingEvent::new_span(span, metadata_id, span_id));
+        self.send(TracingEvent::new_span(
+            span,
+            parent_id,
+            metadata_id,
+            span_id,
+        ));
         Id::from_u64(span_id)
     }
 
@@ -183,20 +225,26 @@ impl<F: Fn(TracingEvent) + 'static, S: EventSync> Subscriber for TracingEventSen
         // Practice shows that the caller may not synchronize its register_callsite calls,
         // allowing an event call to take effect before the registration completes.
         // We guarantee that references are valid, even when multi-threaded.
-        self.sync
-            .ensure_callsite_registered(event.metadata(), &self.on_event);
+        let parent = self.sync.on_new_span_or_event(
+            event.metadata(),
+            event.parent(),
+            event.is_contextual(),
+            &self.on_event,
+        );
 
         let metadata_id = metadata_id(event.metadata());
-        self.send(TracingEvent::new_event(event, metadata_id));
+        self.send(TracingEvent::new_event(event, parent, metadata_id));
     }
 
     fn enter(&self, span: &Id) {
+        self.sync.enter(span);
         self.send(TracingEvent::SpanEntered {
             id: span.into_u64(),
         });
     }
 
     fn exit(&self, span: &Id) {
+        self.sync.exit(span);
         self.send(TracingEvent::SpanExited {
             id: span.into_u64(),
         });

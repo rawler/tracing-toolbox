@@ -17,6 +17,7 @@ use tracing_tunnel::{
 };
 
 mod fib;
+mod multi_thread;
 
 #[derive(Debug)]
 struct RecordedEvents {
@@ -26,7 +27,7 @@ struct RecordedEvents {
 
 // **NB.** Tests calling the `fib` module should block on `EVENTS`; otherwise,
 // the snapshot tests may fail because of the differing ordering of `NewCallSite` events.
-static EVENTS: LazyLock<RecordedEvents> = LazyLock::new(|| RecordedEvents {
+pub(crate) static EVENTS: LazyLock<RecordedEvents> = LazyLock::new(|| RecordedEvents {
     short: fib::record_events(5),
     long: fib::record_events(80),
 });

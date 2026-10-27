@@ -114,7 +114,9 @@
 //!
 //! In multithreaded environments when tracing events / spans are produced by multiple threads,
 //! you should use `TracingEventSender::sync()` constructor instead of `new()`. This will ensure that
-//! metadata registration events are always emitted before events referencing this metadata.
+//! metadata registration events are always emitted before events referencing this metadata,
+//! and that contextual parents of spans and events are resolved for each thread separately
+//! (otherwise, the receiver may attribute events to spans from other threads).
 //! This requires the `std` crate feature.
 //!
 //! ```
@@ -173,7 +175,9 @@ pub use crate::sender::{EventSync, TracingEventSender};
 #[cfg(feature = "std")]
 pub use crate::value::TracedError;
 pub use crate::{
-    types::{CallSiteData, CallSiteKind, MetadataId, RawSpanId, TracingEvent, TracingLevel},
+    types::{
+        CallSiteData, CallSiteKind, MetadataId, ROOT_SPAN_ID, RawSpanId, TracingEvent, TracingLevel,
+    },
     value::{DebugObject, FromTracedValue, TracedValue},
     values::{TracedValues, TracedValuesIter},
 };

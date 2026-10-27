@@ -348,3 +348,32 @@ fn event_with_unknown_metadata_does_not_create_parent_spans() {
     assert_matches!(err, ReceiveError::UnknownMetadataId(42));
     assert!(!receiver.local_spans.inner.contains_key(&1));
 }
+
+#[test]
+fn host_span_outlives_its_scope_while_relayed_spans_are_entered() {
+    tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+        let mut receiver = receiver_with_persisted_span();
+        // Create the local span for relayed span 1 outside the host span, so that it doesn't
+        // keep the host span alive as its parent.
+        receiver.receive(TracingEvent::NewEvent {
+            metadata_id: 0,
+            parent: Some(1),
+            values: TracedValues::new(),
+        });
+        let host_span = tracing::info_span!("host");
+        let host_guard = host_span.enter();
+        receiver.receive(TracingEvent::SpanEntered { id: 1 });
+        // Close the host span; it must stay alive while relayed span 1 is entered.
+        drop(host_guard);
+        drop(host_span);
+
+        receiver.receive(TracingEvent::NewSpan {
+            id: 2,
+            parent_id: Some(ROOT_SPAN_ID),
+            metadata_id: 0,
+            values: TracedValues::new(),
+        });
+        receiver.receive(TracingEvent::SpanExited { id: 1 });
+        assert!(receiver.current_execution.host_span.is_none());
+    });
+}

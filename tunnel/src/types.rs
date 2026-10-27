@@ -17,6 +17,21 @@ pub type MetadataId = u64;
 /// ID of a tracing span as used in [`TracingEvent`]s.
 pub type RawSpanId = u64;
 
+/// Span ID used as a parent in [`TracingEvent`]s to mark spans and events that have no parent
+/// on the sender side (contextual spans / events outside any span, or explicit roots such as
+/// `info_span!(parent: None, ..)`). This value is never used as an ID of an actual span.
+///
+/// Unlike `None` (the contextual parent, i.e. the current span on the receiver side, which may be
+/// a relayed span), such spans and events are never attached to relayed spans. Instead, they are
+/// attached to the span that was current on the receiver side before any relayed spans were entered
+/// (e.g., the span within which the receiver is called), or become roots if there was no such span.
+///
+/// The receiver-side span is determined when the first relayed span is entered, and is used
+/// until all relayed spans are exited. Thus, if a relayed span remains entered across
+/// `TracingEventReceiver` calls made inside different spans, spans and events with `ROOT_SPAN_ID`
+/// are attached to the span current during the first call.
+pub const ROOT_SPAN_ID: RawSpanId = 0;
+
 /// Tracing level defined in [`CallSiteData`].
 ///
 /// This corresponds to [`Level`] from the `tracing-core` library, but is (de)serializable.
@@ -133,7 +148,8 @@ pub enum TracingEvent {
     NewSpan {
         /// Unique ID of the span that will be used to refer to it in the following events.
         id: RawSpanId,
-        /// Parent span ID. `None` means using the contextual parent (i.e., the current span).
+        /// Parent span ID. `None` means using the contextual parent (i.e., the current span)
+        /// on the receiver side; [`ROOT_SPAN_ID`] means that there is no parent on the sender side.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_id: Option<RawSpanId>,
         /// ID of the span metadata.
@@ -180,7 +196,8 @@ pub enum TracingEvent {
     NewEvent {
         /// ID of the event metadata.
         metadata_id: MetadataId,
-        /// Parent span ID. `None` means using the contextual parent (i.e., the current span).
+        /// Parent span ID. `None` means using the contextual parent (i.e., the current span)
+        /// on the receiver side; [`ROOT_SPAN_ID`] means that there is no parent on the sender side.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent: Option<RawSpanId>,
         /// Values associated with the event.

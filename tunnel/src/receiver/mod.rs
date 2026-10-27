@@ -14,7 +14,9 @@ use tracing_core::{
 };
 
 use self::arena::ARENA;
-use crate::{CallSiteData, MetadataId, RawSpanId, TracedValue, TracedValues, TracingEvent};
+use crate::{
+    CallSiteData, MetadataId, ROOT_SPAN_ID, RawSpanId, TracedValue, TracedValues, TracingEvent,
+};
 
 mod arena;
 #[cfg(test)]
@@ -58,6 +60,17 @@ impl TracedValue {
             }
         })
     }
+}
+
+/// Local parent of a span or event being relayed.
+#[derive(Debug)]
+enum LocalParent {
+    /// Contextual parent, i.e. the current span on the receiver side.
+    Contextual,
+    /// No parent at all. Used for spans / events without a parent on the sender side
+    /// if there was no host span to attach them to.
+    None,
+    Span(Id),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,10 +214,20 @@ struct CurrentExecution {
     /// Number of times each span is currently entered. A span may be entered multiple times
     /// concurrently, e.g. from different threads of the sender.
     entered_span_ids: HashMap<RawSpanId, usize>,
+    /// Local span that was current before any relayed spans were entered (i.e., the span
+    /// of the receiving host). Only set while `entered_span_ids` is non-empty. The span is cloned
+    /// in the local dispatcher, so that it stays alive while it may be used as a parent.
+    host_span: Option<Id>,
 }
 
 impl CurrentExecution {
     fn enter_span(&mut self, id: RawSpanId) {
+        if self.entered_span_ids.is_empty() {
+            self.host_span = TracingEventReceiver::dispatch(|dispatch| {
+                let current = dispatch.current_span();
+                current.id().map(|id| dispatch.clone_span(id))
+            });
+        }
         *self.entered_span_ids.entry(id).or_default() += 1;
     }
 
@@ -213,6 +236,16 @@ impl CurrentExecution {
             *count -= 1;
             if *count == 0 {
                 self.entered_span_ids.remove(&id);
+                self.release_host_span();
+            }
+        }
+    }
+
+    /// Releases the host span once no relayed spans are entered.
+    fn release_host_span(&mut self) {
+        if self.entered_span_ids.is_empty() {
+            if let Some(host_span) = self.host_span.take() {
+                TracingEventReceiver::dispatch(|dispatch| dispatch.try_close(host_span));
             }
         }
     }
@@ -220,7 +253,23 @@ impl CurrentExecution {
     /// Removes the span from the execution, returning the number of times it is still entered.
     fn remove_span(&mut self, id: RawSpanId) -> usize {
         self.uncommitted_span_ids.remove(&id);
-        self.entered_span_ids.remove(&id).unwrap_or(0)
+        let entered_count = self.entered_span_ids.remove(&id).unwrap_or(0);
+        self.release_host_span();
+        entered_count
+    }
+
+    /// Resolves the local parent for spans / events without a parent on the sender side.
+    /// Such spans / events are attached to the host span; relayed spans that are currently entered
+    /// are ignored, since the sender has explicitly specified that they are not the parent.
+    fn root_parent(&self) -> LocalParent {
+        if self.entered_span_ids.is_empty() {
+            // No relayed spans are entered, so the current span is the host span.
+            LocalParent::Contextual
+        } else if let Some(host_span) = &self.host_span {
+            LocalParent::Span(host_span.clone())
+        } else {
+            LocalParent::None
+        }
     }
 
     fn finalize(&mut self, local_spans: &LocalSpans) {
@@ -233,6 +282,7 @@ impl CurrentExecution {
                 });
             }
         }
+        self.release_host_span();
         for id in mem::take(&mut self.uncommitted_span_ids) {
             if let Some(local_id) = local_spans.inner.get(&id) {
                 TracingEventReceiver::dispatch(|dispatch| dispatch.try_close(local_id.clone()));
@@ -411,6 +461,19 @@ impl TracingEventReceiver {
         }
     }
 
+    fn on_new_span(&mut self, id: RawSpanId, data: SpanData) -> Result<(), ReceiveError> {
+        Self::ensure_values_len(&data.values)?;
+
+        if !self.local_spans.inner.contains_key(&id) {
+            let local_parent = self.local_parent(data.parent_id)?;
+            let local_id = self.create_local_span(&data, &local_parent)?;
+            self.local_spans.inner.insert(id, local_id);
+        }
+        self.spans.inner.insert(id, data);
+        self.current_execution.uncommitted_span_ids.insert(id);
+        Ok(())
+    }
+
     /// Returns the local ID for the specified remote span, creating the local span if necessary
     /// (e.g., if the span was restored from the persisted state).
     fn local_span_id(&mut self, id: RawSpanId) -> Result<Id, ReceiveError> {
@@ -431,43 +494,42 @@ impl TracingEventReceiver {
             return Err(ReceiveError::SpanParentCycle(id));
         }
         let parent_id = self.span(id)?.parent_id;
-        let local_parent_id = self.local_parent_id_checked(parent_id, created_ids)?;
-        let local_id = self.create_local_span(self.span(id)?, local_parent_id.as_ref())?;
+        let local_parent = self.local_parent_checked(parent_id, created_ids)?;
+        let local_id = self.create_local_span(self.span(id)?, &local_parent)?;
         self.local_spans.inner.insert(id, local_id.clone());
         Ok(local_id)
     }
 
-    fn local_parent_id(
-        &mut self,
-        parent_id: Option<RawSpanId>,
-    ) -> Result<Option<Id>, ReceiveError> {
-        self.local_parent_id_checked(parent_id, &mut HashSet::new())
+    fn local_parent(&mut self, parent_id: Option<RawSpanId>) -> Result<LocalParent, ReceiveError> {
+        self.local_parent_checked(parent_id, &mut HashSet::new())
     }
 
-    fn local_parent_id_checked(
+    fn local_parent_checked(
         &mut self,
         parent_id: Option<RawSpanId>,
         created_ids: &mut HashSet<RawSpanId>,
-    ) -> Result<Option<Id>, ReceiveError> {
-        parent_id
-            .map(|id| self.local_span_id_checked(id, created_ids))
-            .transpose()
+    ) -> Result<LocalParent, ReceiveError> {
+        Ok(match parent_id {
+            None => LocalParent::Contextual,
+            Some(ROOT_SPAN_ID) => self.current_execution.root_parent(),
+            Some(id) => LocalParent::Span(self.local_span_id_checked(id, created_ids)?),
+        })
     }
 
     fn create_local_span(
         &self,
         data: &SpanData,
-        local_parent_id: Option<&Id>,
+        local_parent: &LocalParent,
     ) -> Result<Id, ReceiveError> {
         let metadata = self.metadata(data.metadata_id)?;
 
         let value_set = Self::generate_fields(metadata, &data.values);
         let value_set = Self::expand_fields(&value_set);
         let value_set = Self::create_values(metadata.fields(), &value_set);
-        let attributes = if let Some(local_parent_id) = local_parent_id {
-            Attributes::child_of(local_parent_id.clone(), metadata, &value_set)
-        } else {
-            Attributes::new(metadata, &value_set)
+        let attributes = match local_parent {
+            LocalParent::Contextual => Attributes::new(metadata, &value_set),
+            LocalParent::None => Attributes::new_root(metadata, &value_set),
+            LocalParent::Span(id) => Attributes::child_of(id.clone(), metadata, &value_set),
         };
 
         Ok(Self::dispatch(|dispatch| dispatch.new_span(&attributes)))
@@ -496,21 +558,13 @@ impl TracingEventReceiver {
                 metadata_id,
                 values,
             } => {
-                Self::ensure_values_len(&values)?;
-
                 let data = SpanData {
                     metadata_id,
                     parent_id,
                     ref_count: 1,
                     values,
                 };
-                if !self.local_spans.inner.contains_key(&id) {
-                    let local_parent_id = self.local_parent_id(parent_id)?;
-                    let local_id = self.create_local_span(&data, local_parent_id.as_ref())?;
-                    self.local_spans.inner.insert(id, local_id);
-                }
-                self.spans.inner.insert(id, data);
-                self.current_execution.uncommitted_span_ids.insert(id);
+                self.on_new_span(id, data)?;
             }
 
             TracingEvent::FollowsFrom { id, follows_from } => {
@@ -584,14 +638,14 @@ impl TracingEventReceiver {
                 Self::ensure_values_len(&values)?;
 
                 let metadata = self.metadata(metadata_id)?;
-                let parent = self.local_parent_id(parent)?;
+                let parent = self.local_parent(parent)?;
                 let values = Self::generate_fields(metadata, &values);
                 let values = Self::expand_fields(&values);
                 let values = Self::create_values(metadata.fields(), &values);
-                let event = if let Some(parent) = parent {
-                    Event::new_child_of(parent.clone(), metadata, &values)
-                } else {
-                    Event::new(metadata, &values)
+                let event = match parent {
+                    LocalParent::Contextual => Event::new(metadata, &values),
+                    LocalParent::None => Event::new_child_of(None, metadata, &values),
+                    LocalParent::Span(id) => Event::new_child_of(id, metadata, &values),
                 };
                 Self::dispatch(|dispatch| dispatch.event(&event));
             }

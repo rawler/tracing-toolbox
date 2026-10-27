@@ -8,9 +8,20 @@ The project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html)
 ### Changed
 
 - Bump minimum supported Rust version to 1.85 and switch to 2024 edition.
+- Extend the event format: a parent of `ROOT_SPAN_ID` (0) marks spans and events without a parent
+  on the sender side. The receiver attaches them to its current non-relayed span (if any),
+  as opposed to `None`, which is resolved against the receiver's current span including relayed spans.
+  `TracingEventSender` sends `ROOT_SPAN_ID` for spans and events without a parent on the sender side
+  that it knows of: explicit roots (e.g., `info_span!(parent: None, ..)`), and, with `sync()`,
+  also contextual spans and events outside any span.
+  Receivers from previous versions reject `ROOT_SPAN_ID` as an unknown span ID.
+- Make `TracingEventSender::sync()` track the current span for each thread and resolve
+  contextual parents of spans and events on the sender side.
 
 ### Fixed
 
+- Fix spans and events being attributed to spans from other threads when `TracingEventSender::sync()`
+  is used from multiple threads concurrently.
 - Fix `TracingEventReceiver` ignoring parents of spans and events if the parent span
   was restored from the persisted state, but not yet entered.
 - Fix `TracingEventReceiver` exiting a span only once on drop if it was entered multiple times
